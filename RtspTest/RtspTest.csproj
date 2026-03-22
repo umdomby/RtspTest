@@ -7,13 +7,11 @@
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
-  
+
   <ItemGroup>
-    <PackageReference Include="OpenCvSharp4"              Version="4.13.0.20260318" />
-    <PackageReference Include="OpenCvSharp4.Extensions"    Version="4.13.0.20260318" />
-    <!-- или 20260317, если не установит -->
-    <PackageReference Include="OpenCvSharp4.Windows"       Version="4.13.0.20260302" />
-    <!-- ← ключевое изменение -->
+    <PackageReference Include="OpenCvSharp4" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.Extensions" Version="4.10.0.20241108" />
+    <PackageReference Include="OpenCvSharp4.Windows" Version="4.10.0.20241108" />
   </ItemGroup>
 
 </Project>

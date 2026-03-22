@@ -1,29 +1,39 @@
 ﻿using OpenCvSharp;
+using OpenCvSharp.Dnn;
 using OpenCvSharp.Extensions;
 using System;
+using System.Drawing;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Size = OpenCvSharp.Size;
 
 namespace RtspTest
 {
     public partial class Form1 : Form
     {
         private VideoCapture? capture;
+        private Net? net;
         private bool isRunning = false;
         private CancellationTokenSource? cts;
-        private readonly object sync = new();
+        private readonly SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
+
+        private float currentConfidence = 0f;
+        private readonly string modelPath = @"C:\Users\umdom\source\repos\RtspTest\RtspTest\best.onnx";
 
         public Form1()
         {
             InitializeComponent();
             this.DoubleBuffered = true;
-
-            // Устанавливаем таймауты для ffmpeg (очень помогает при проблемах с RTSP)
-            Environment.SetEnvironmentVariable("OPENCV_FFMPEG_CAPTURE_OPTIONS", "timeout;5000000;stimeout;3000000");
-
-            btnStart.Enabled = true;
-            btnStop.Enabled = false;
+            try
+            {
+                // Загружаем модель
+                net = CvDnn.ReadNetFromOnnx(modelPath);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("Ошибка загрузки ONNX: " + ex.Message);
+            }
         }
 
         private async void btnStart_Click(object sender, EventArgs e)
@@ -31,115 +41,130 @@ namespace RtspTest
             if (isRunning) return;
 
             string rtspUrl = "rtsp://127.0.0.1:8554/mystream";
-            // string rtspUrl = "rtsp://192.168.1.121:8554/mystream";
-
             isRunning = true;
             btnStart.Enabled = false;
             btnStop.Enabled = true;
-            this.Text = "RTSP — подключаемся...";
-
             cts = new CancellationTokenSource();
 
             await Task.Run(async () =>
             {
                 try
                 {
-                    capture = new VideoCapture(rtspUrl);
+                    await semaphore.WaitAsync();
+                    try { capture = new VideoCapture(rtspUrl); }
+                    finally { semaphore.Release(); }
 
-                    if (!capture.IsOpened())
+                    if (capture == null || !capture.IsOpened()) return;
+
+                    while (isRunning && !cts.Token.IsCancellationRequested)
                     {
-                        this.InvokeIfNeeded(() =>
+                        using var frame = new Mat();
+
+                        await semaphore.WaitAsync();
+                        bool readSuccess = false;
+                        try
                         {
-                            MessageBox.Show("Не удалось открыть RTSP-поток.\nЗапущен ли VLC? Правильный ли адрес?");
-                            StopCapture();
-                        });
-                        return;
-                    }
+                            if (capture != null && !capture.IsDisposed && capture.IsOpened())
+                                readSuccess = capture.Read(frame);
+                        }
+                        finally { semaphore.Release(); }
 
-                    this.InvokeIfNeeded(() => this.Text = "RTSP — поток идёт");
-
-                    using var frame = new Mat();
-
-                    while (isRunning && !cts.Token.IsCancellationRequested && !this.IsDisposed)
-                    {
-                        if (!capture.Read(frame) || frame.Empty())
+                        if (!readSuccess || frame.Empty())
                         {
-                            await Task.Delay(200);
+                            await Task.Delay(10);
                             continue;
                         }
 
-                        using var bmp = frame.ToBitmap();
+                        // Анализ
+                        bool hasAnomaly = DetectAnomaly(frame);
 
-                        this.InvokeIfNeeded(() =>
-                        {
-                            if (pictureBox1.Image != null)
-                            {
-                                pictureBox1.Image.Dispose();
-                                pictureBox1.Image = null;  // important to avoid race conditions
-                            }
+                        // Рисуем статус
+                        DrawStatus(frame, hasAnomaly);
 
-                            try
-                            {
-                                using var bmp = frame.ToBitmap();
-                                if (bmp == null || bmp.Width <= 0 || bmp.Height <= 0)
-                                {
-                                    // skip bad frame
-                                    return;
-                                }
+                        // Безопасная передача в UI
+                        Bitmap bmp = frame.ToBitmap();
+                        UpdateUI(bmp);
 
-                                // Clone is safer after checks
-                                pictureBox1.Image = new Bitmap(bmp);  // or bmp.Clone(new Rectangle(0,0,bmp.Width,bmp.Height), bmp.PixelFormat);
-                            }
-                            catch (Exception ex)
-                            {
-                                // log or ignore - don't crash whole loop
-                                System.Diagnostics.Debug.WriteLine("Bitmap conversion failed: " + ex.Message);
-                            }
-                        });
-
-                        await Task.Delay(40);   // ≈ 25 fps
-
-
-                        //this.InvokeIfNeeded(() =>
-                        //{
-                        //    var old = pictureBox1.Image as Bitmap;           // сохраняем ссылку
-                        //    pictureBox1.Image = bmp.Clone() as Bitmap;       // новый клон
-                        //    old?.Dispose();                                  // старый убираем после присваивания
-                        //});
-
-                        //await Task.Delay(40);   // ≈ 25 fps
+                        await Task.Delay(5);
                     }
                 }
-                catch (Exception ex)
-                {
-                    this.InvokeIfNeeded(() =>
-                    {
-                        MessageBox.Show("Ошибка при работе с видео:\n" + ex.Message);
-                        StopCapture();
-                    });
-                }
-                finally
-                {
-                    this.InvokeIfNeeded(StopCapture);
-                }
+                catch { }
+                finally { this.InvokeIfNeeded(() => StopCapture()); }
             }, cts.Token);
         }
 
-        private void btnStop_Click(object sender, EventArgs e)
+        private bool DetectAnomaly(Mat frame)
         {
-            StopCapture();
+            // Проверка net на null исправляет CS8602
+            if (net == null) return false;
+
+            try
+            {
+                using var blob = CvDnn.BlobFromImage(frame, 1.0 / 255.0, new Size(640, 640), new Scalar(0, 0, 0), true, false);
+
+                lock (net)
+                {
+                    net.SetInput(blob);
+                    using var output = net.Forward();
+
+                    output.GetArray(out float[] data);
+
+                    int rows = output.Size(1);
+                    int cols = output.Size(2);
+                    float maxConf = 0;
+
+                    // Пытаемся найти уверенность в данных
+                    if (rows >= 5)
+                    {
+                        for (int i = 0; i < cols; i++)
+                        {
+                            float conf = data[(4 * cols) + i];
+                            if (conf > maxConf && conf <= 1.0f) maxConf = conf;
+                        }
+                    }
+
+                    // Если в 4-й строке ничего нет, ищем максимум по всему массиву (для некоторых моделей)
+                    if (maxConf < 0.001f)
+                    {
+                        foreach (var v in data) if (v > maxConf && v <= 1.0f) maxConf = v;
+                    }
+
+                    currentConfidence = maxConf * 100f;
+                    return maxConf > 0.45f;
+                }
+            }
+            catch { return false; }
+        }
+
+        private void DrawStatus(Mat frame, bool isAnomaly)
+        {
+            Scalar color = isAnomaly ? new Scalar(0, 0, 255) : new Scalar(0, 255, 0);
+            Cv2.Rectangle(frame, new OpenCvSharp.Point(10, 10), new OpenCvSharp.Point(550, 150), new Scalar(0, 0, 0), -1);
+            Cv2.Circle(frame, new OpenCvSharp.Point(60, 80), 35, color, -1);
+            Cv2.PutText(frame, isAnomaly ? "ANOMALY!" : "STABLE", new OpenCvSharp.Point(110, 75),
+                HersheyFonts.HersheyComplex, 1.9, color, 3, LineTypes.AntiAlias);
+            Cv2.PutText(frame, $"CONF: {currentConfidence:F1}%", new OpenCvSharp.Point(110, 125),
+                HersheyFonts.HersheySimplex, 1.2, new Scalar(255, 255, 255), 2, LineTypes.AntiAlias);
+        }
+
+        private void UpdateUI(Bitmap bmp)
+        {
+            this.InvokeIfNeeded(() =>
+            {
+                this.Text = $"DETECTOR [{currentConfidence:F1}%]";
+                var old = pictureBox1.Image;
+                pictureBox1.Image = bmp;
+                old?.Dispose();
+            });
         }
 
         private void StopCapture()
         {
-            if (!isRunning) return;
-
             isRunning = false;
             cts?.Cancel();
-            cts?.Dispose();
-            cts = null;
 
-            lock (sync)
+            semaphore.Wait(500);
+            try
             {
                 if (capture != null)
                 {
@@ -148,35 +173,35 @@ namespace RtspTest
                     capture = null;
                 }
             }
+            finally { semaphore.Release(); }
 
-            this.InvokeIfNeeded(() =>
-            {
-                if (pictureBox1.Image != null)
-                {
-                    pictureBox1.Image.Dispose();
-                    pictureBox1.Image = null;
-                }
-
+            this.InvokeIfNeeded(() => {
+                pictureBox1.Image?.Dispose();
+                pictureBox1.Image = null;
                 btnStart.Enabled = true;
                 btnStop.Enabled = false;
-                this.Text = "RTSP просмотр";
             });
         }
 
+        private void btnStop_Click(object sender, EventArgs e) => StopCapture();
+
         private void InvokeIfNeeded(Action action)
         {
-            if (this.IsHandleCreated && !this.IsDisposed)
+            if (!this.IsDisposed && this.IsHandleCreated)
             {
-                if (this.InvokeRequired)
-                    this.BeginInvoke(action);
-                else
-                    action();
+                if (this.InvokeRequired) this.BeginInvoke(action);
+                else action();
             }
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             StopCapture();
+            Thread.Sleep(100);
+            if (net != null)
+            {
+                lock (net) { net.Dispose(); net = null; }
+            }
             base.OnFormClosing(e);
         }
     }
