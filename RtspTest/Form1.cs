@@ -75,8 +75,26 @@ namespace RtspTest
                             if (pictureBox1.Image != null)
                             {
                                 pictureBox1.Image.Dispose();
+                                pictureBox1.Image = null;  // important to avoid race conditions
                             }
-                            pictureBox1.Image = (System.Drawing.Bitmap)bmp.Clone();
+
+                            try
+                            {
+                                using var bmp = frame.ToBitmap();
+                                if (bmp == null || bmp.Width <= 0 || bmp.Height <= 0)
+                                {
+                                    // skip bad frame
+                                    return;
+                                }
+
+                                // Clone is safer after checks
+                                pictureBox1.Image = new Bitmap(bmp);  // or bmp.Clone(new Rectangle(0,0,bmp.Width,bmp.Height), bmp.PixelFormat);
+                            }
+                            catch (Exception ex)
+                            {
+                                // log or ignore - don't crash whole loop
+                                System.Diagnostics.Debug.WriteLine("Bitmap conversion failed: " + ex.Message);
+                            }
                         });
 
                         await Task.Delay(40);   // ≈ 25 fps
