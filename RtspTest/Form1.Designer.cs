@@ -68,6 +68,7 @@
             Controls.Add(btnStop);
             Name = "Form1";
             Text = "RTSP просмотр";
+            Load += Form1_Load;
             ((System.ComponentModel.ISupportInitialize)pictureBox1).EndInit();
             ResumeLayout(false);
         }

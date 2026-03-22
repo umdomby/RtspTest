@@ -95,45 +95,46 @@ namespace RtspTest
 
         private bool DetectAnomaly(Mat frame)
         {
-            // Проверка net на null исправляет CS8602
             if (net == null) return false;
 
             try
             {
-                using var blob = CvDnn.BlobFromImage(frame, 1.0 / 255.0, new Size(640, 640), new Scalar(0, 0, 0), true, false);
+                // 1. Подготовка изображения (Preprocessing)
+                // Модель обучена на 224x224. Делаем letterbox, чтобы сохранить пропорции.
+                using var letterboxedFrame = Letterbox(frame, new Size(224, 224));
+
+                // Создаем blob с правильным размером 224x224 и нормализацией
+                using var blob = CvDnn.BlobFromImage(letterboxedFrame, 1.0 / 255.0, new Size(224, 224), new Scalar(0, 0, 0), true, false);
 
                 lock (net)
                 {
+                    // 2. Инференс (Inference)
                     net.SetInput(blob);
                     using var output = net.Forward();
 
-                    output.GetArray(out float[] data);
+                    // 3. Разбор выходных данных (Postprocessing)
+                    // Для классификатора выход — это плоский массив вероятностей классов.
+                    output.GetArray(out float[] probabilities);
 
-                    int rows = output.Size(1);
-                    int cols = output.Size(2);
-                    float maxConf = 0;
+                    // probabilities[0] — это 'anomaly', т.к. папка идет первой по алфавиту
+                    // probabilities[1] — это 'normal'
 
-                    // Пытаемся найти уверенность в данных
-                    if (rows >= 5)
-                    {
-                        for (int i = 0; i < cols; i++)
-                        {
-                            float conf = data[(4 * cols) + i];
-                            if (conf > maxConf && conf <= 1.0f) maxConf = conf;
-                        }
-                    }
+                    float anomalyScore = probabilities[0];
+                    float normalScore = probabilities[1];
 
-                    // Если в 4-й строке ничего нет, ищем максимум по всему массиву (для некоторых моделей)
-                    if (maxConf < 0.001f)
-                    {
-                        foreach (var v in data) if (v > maxConf && v <= 1.0f) maxConf = v;
-                    }
+                    // Обновляем уверенность для отображения (берем вероятность аномалии)
+                    currentConfidence = anomalyScore * 100f;
 
-                    currentConfidence = maxConf * 100f;
-                    return maxConf > 0.45f;
+                    // Если вероятность аномалии выше 0.5 (или 50%), бьем тревогу
+                    // Вы можете настроить этот порог (например, 0.7 или 0.8) для уменьшения ложных срабатываний.
+                    return anomalyScore > 0.5f;
                 }
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine("Ошибка классификации: " + ex.Message);
+                return false;
+            }
         }
 
         private void DrawStatus(Mat frame, bool isAnomaly)
@@ -175,7 +176,8 @@ namespace RtspTest
             }
             finally { semaphore.Release(); }
 
-            this.InvokeIfNeeded(() => {
+            this.InvokeIfNeeded(() =>
+            {
                 pictureBox1.Image?.Dispose();
                 pictureBox1.Image = null;
                 btnStart.Enabled = true;
@@ -194,6 +196,23 @@ namespace RtspTest
             }
         }
 
+        private Mat Letterbox(Mat source, Size targetSize)
+        {
+            float scale = Math.Min((float)targetSize.Width / source.Width, (float)targetSize.Height / source.Height);
+            int newWidth = (int)(source.Width * scale);
+            int newHeight = (int)(source.Height * scale);
+
+            using var resized = new Mat();
+            Cv2.Resize(source, resized, new Size(newWidth, newHeight));
+
+            var padded = new Mat(targetSize, source.Type(), Scalar.All(0)); // Черные полосы
+            int x = (targetSize.Width - newWidth) / 2;
+            int y = (targetSize.Height - newHeight) / 2;
+
+            resized.CopyTo(new Mat(padded, new Rect(x, y, newWidth, newHeight)));
+            return padded;
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             StopCapture();
@@ -203,6 +222,11 @@ namespace RtspTest
                 lock (net) { net.Dispose(); net = null; }
             }
             base.OnFormClosing(e);
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+
         }
     }
 }
