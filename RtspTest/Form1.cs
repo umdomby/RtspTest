@@ -19,7 +19,7 @@ namespace RtspTest
         private readonly SemaphoreSlim semaphore = new SemaphoreSlim(1, 1);
 
         private float currentConfidence = 0f;
-        private readonly string modelPath = @"C:\Users\umdom\source\repos\RtspTest\RtspTest\best.onnx";
+        private readonly string modelPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "best.onnx");
 
         public Form1()
         {
